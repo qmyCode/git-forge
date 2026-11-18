@@ -1,67 +1,25 @@
-// The HTTP router: one process serving the forge's four surfaces from the one store — git smart
-// HTTP at /{owner}/{repo}.git, REST under /api/v3, GraphQL at /api/graphql, MCP at /mcp — plus
-// the unauthenticated /healthz the harness boots against. Every API and git call carries the
-// suite's bearer token; a missing or wrong one is a 401 before any routing happens.
+// app.ts — the HTTP shell: routing, the bearer-token gate, body reading and
+// response writing for every surface (REST, GraphQL, MCP, git smart HTTP,
+// /healthz). Handlers are pure functions of a pre-parsed WebRequest; the shell
+// owns everything socket-shaped so the surfaces stay small and fast.
+//
+// The request path is deliberately lean — a manual URL split instead of the
+// URL parser, one pass over the body, and no per-request state beyond a
+// monotonically increasing request-id counter — because the benchmark's read
+// workload issues 2,000 requests over one keep-alive connection.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { TOKEN, getRepo } from './store.ts';
-import { handleRest, type RestContext } from './rest.ts';
-import { handleGraphQL } from './graphql.ts';
-import { handleMCP } from './mcp.ts';
-import { handleInfoRefs, handleUploadPack, handleReceivePack } from './gitproto.ts';
+import { VIEWER, forge } from './store.ts';
+import { gitInfoRefs, gitServicePost } from './git.ts';
+import { handleRest } from './rest.ts';
+import { handleGraphql } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { HttpError, errorResponse, type WebRequest, type WebResponse } from './web.ts';
 
+const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
-let routerRequestCounter = 0;
-
-function sendJson(res: ServerResponse, status: number, value: unknown): void {
-  routerRequestCounter += 1;
-  const body = Buffer.from(JSON.stringify(value), 'utf8');
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': body.length,
-    // Router-level replies (401s among them) carry the header the protocol checks require too.
-    'x-github-request-id': `req-${routerRequestCounter}`,
-  });
-  res.end(body);
-}
-
-function authorized(req: IncomingMessage): boolean {
-  if (TOKEN === '') return true;
-  return req.headers['authorization'] === `Bearer ${TOKEN}`;
-}
-
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
-}
-
-interface ParsedBody {
-  /** The parsed JSON value when the body was JSON; otherwise undefined. */
-  json: unknown;
-  /** True when a non-empty body failed to parse as JSON. */
-  malformed: boolean;
-  /** The parsed JSON value when it is a plain object; otherwise undefined. */
-  object: Record<string, unknown> | undefined;
-}
-
-function parseBody(raw: Buffer): ParsedBody {
-  if (raw.length === 0) return { json: undefined, malformed: false, object: undefined };
-  try {
-    const json: unknown = JSON.parse(raw.toString('utf8'));
-    const object = typeof json === 'object' && json !== null && !Array.isArray(json) ? (json as Record<string, unknown>) : undefined;
-    return { json, malformed: false, object };
-  } catch {
-    return { json: undefined, malformed: true, object: undefined };
-  }
-}
+let requestCounter = 0;
 
 function decodeSegment(segment: string): string {
   try {
@@ -71,125 +29,119 @@ function decodeSegment(segment: string): string {
   }
 }
 
-async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const method = (req.method ?? 'GET').toUpperCase();
-  const url = new URL(req.url ?? '/', 'http://internal');
-  const pathname = url.pathname;
-  const origin = `http://${req.headers['host'] ?? 'localhost'}`;
-
-  // The boot check: no auth, always the same answer.
-  if (pathname === '/healthz') {
-    if (method === 'GET') sendJson(res, 200, { ok: true });
-    else sendJson(res, 404, { message: 'Not Found' });
-    return;
-  }
-
-  // Git smart HTTP: /{owner}/{repo}.git/...
-  const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(pathname);
-  if (gitMatch !== null) {
-    if (!authorized(req)) {
-      sendJson(res, 401, { message: 'Requires authentication' });
-      return;
-    }
-    const owner = decodeSegment(gitMatch[1] as string);
-    const name = decodeSegment(gitMatch[2] as string);
-    const repo = getRepo(owner, name);
-    const tail = gitMatch[3] ?? '';
-    if (tail === '/info/refs' && method === 'GET') {
-      const service = url.searchParams.get('service') ?? '';
-      if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
-        sendJson(res, 400, { message: 'Bad Request' });
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        reject(new HttpError(413, 'Request body too large'));
+        req.destroy();
         return;
       }
-      const protocolV2 = (req.headers['git-protocol'] ?? '').toString().includes('version=2');
-      handleInfoRefs(req, res, repo, service, protocolV2);
-      return;
-    }
-    if (tail === '/git-upload-pack' && method === 'POST') {
-      const body = await readBody(req);
-      const protocolV2 = (req.headers['git-protocol'] ?? '').toString().includes('version=2');
-      handleUploadPack(res, repo, body, protocolV2);
-      return;
-    }
-    if (tail === '/git-receive-pack' && method === 'POST') {
-      const body = await readBody(req);
-      handleReceivePack(res, repo, body);
-      return;
-    }
-    sendJson(res, 404, { message: 'Not Found' });
-    return;
-  }
-
-  // REST v3.
-  if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
-    if (!authorized(req)) {
-      sendJson(res, 401, { message: 'Requires authentication' });
-      return;
-    }
-    // Every method may carry a body here (DELETE on the contents route does).
-    const parsed = parseBody(await readBody(req));
-    const segments = pathname
-      .replace(/^\/api\/v3\/?/, '')
-      .split('/')
-      .filter((segment) => segment !== '')
-      .map(decodeSegment);
-    const ctx: RestContext = { origin, body: parsed.object, bodyMalformed: parsed.malformed, query: url.searchParams };
-    handleRest(req, res, ctx, segments);
-    return;
-  }
-
-  // GraphQL.
-  if (pathname === '/api/graphql') {
-    if (method !== 'POST') {
-      sendJson(res, 404, { message: 'Not Found' });
-      return;
-    }
-    if (!authorized(req)) {
-      sendJson(res, 401, { message: 'Requires authentication' });
-      return;
-    }
-    const parsed = parseBody(await readBody(req));
-    if (parsed.malformed) {
-      sendJson(res, 400, { errors: [{ message: 'Problems parsing JSON' }] });
-      return;
-    }
-    handleGraphQL(res, parsed.json);
-    return;
-  }
-
-  // MCP.
-  if (pathname === '/mcp') {
-    if (method === 'GET') {
-      sendJson(res, 405, { message: 'Method Not Allowed' });
-      return;
-    }
-    if (method === 'DELETE') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{}');
-      return;
-    }
-    if (method !== 'POST') {
-      sendJson(res, 405, { message: 'Method Not Allowed' });
-      return;
-    }
-    if (!authorized(req)) {
-      sendJson(res, 401, { message: 'Requires authentication' });
-      return;
-    }
-    const parsed = parseBody(await readBody(req));
-    handleMCP(res, parsed.json, parsed.malformed, origin);
-    return;
-  }
-
-  sendJson(res, 404, { message: 'Not Found' });
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
-/** Build the forge's HTTP server (main.ts binds it to an ephemeral port and registers it). */
-export function createApp(): Server {
-  return createServer((req, res) => {
-    route(req, res).catch(() => {
-      if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
-      else res.end();
-    });
+function writeResponse(res: ServerResponse, response: WebResponse): void {
+  const body = typeof response.body === 'string' ? Buffer.from(response.body, 'utf8') : response.body;
+  res.sendDate = false;
+  res.statusCode = response.status;
+  res.setHeader('content-type', response.contentType);
+  res.setHeader('x-github-request-id', `forge-${(requestCounter += 1).toString(36)}`);
+  if (response.headers !== undefined) {
+    for (const [name, value] of Object.entries(response.headers)) res.setHeader(name, value);
+  }
+  res.setHeader('content-length', String(body.length));
+  res.end(body);
+}
+
+function authorized(req: IncomingMessage): boolean {
+  if (TOKEN === '') return true;
+  return req.headers.authorization === `Bearer ${TOKEN}`;
+}
+
+async function route(req: IncomingMessage): Promise<WebResponse> {
+  const url = req.url ?? '/';
+  const qIndex = url.indexOf('?');
+  const rawPath = qIndex === -1 ? url : url.slice(0, qIndex);
+  const query = new URLSearchParams(qIndex === -1 ? '' : url.slice(qIndex + 1));
+  const segments = rawPath.split('/').filter((part) => part !== '').map(decodeSegment);
+  const method = (req.method ?? 'GET').toUpperCase();
+
+  // The boot probe is unauthenticated by design.
+  if (method === 'GET' && segments.length === 1 && segments[0] === 'healthz') {
+    return { status: 200, body: '{"ok":true}', contentType: 'application/json; charset=utf-8' };
+  }
+
+  if (!authorized(req)) return errorResponse(401, 'Bad credentials');
+
+  const rawBody = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+  const webRequest: WebRequest = {
+    method,
+    segments,
+    query,
+    rawBody,
+    host: req.headers.host ?? 'localhost',
+    gitProtocol: typeof req.headers['git-protocol'] === 'string' ? req.headers['git-protocol'] : null,
+    json(): unknown {
+      if (rawBody.length === 0) return {};
+      try {
+        return JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        throw new HttpError(400, 'Problems parsing JSON');
+      }
+    },
+  };
+
+  // REST v3.
+  if (segments[0] === 'api' && segments[1] === 'v3') return handleRest(webRequest);
+  // GraphQL v4.
+  if (segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2) return handleGraphql(webRequest);
+  // MCP.
+  if (segments[0] === 'mcp' && segments.length === 1) return handleMcp(webRequest);
+
+  // Git smart HTTP: /{owner}/{repo}.git/...
+  if (segments.length >= 3 && (segments[1] as string).endsWith('.git')) {
+    const owner = segments[0] as string;
+    const repoName = (segments[1] as string).slice(0, -4);
+    const repo = owner === VIEWER.login ? (forge.repos.get(repoName) ?? null) : null;
+    if (segments[2] === 'info' && segments[3] === 'refs' && method === 'GET') {
+      const service = query.get('service') ?? '';
+      const protocolV2 = (webRequest.gitProtocol ?? '').includes('version=2');
+      const answer = gitInfoRefs(repo, service, protocolV2);
+      return { status: answer.status, body: answer.body, contentType: answer.contentType };
+    }
+    if ((segments[2] === 'git-upload-pack' || segments[2] === 'git-receive-pack') && method === 'POST') {
+      const answer = gitServicePost(repo, segments[2], rawBody);
+      return { status: answer.status, body: answer.body, contentType: answer.contentType };
+    }
+    return errorResponse(404, 'Not Found');
+  }
+
+  return errorResponse(404, 'Not Found');
+}
+
+export function createForgeServer(): Server {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    route(req)
+      .then((response) => writeResponse(res, response))
+      .catch((err: unknown) => {
+        if (res.headersSent) {
+          res.destroy();
+          return;
+        }
+        if (err instanceof HttpError) {
+          writeResponse(res, errorResponse(err.status, err.message));
+        } else {
+          writeResponse(res, errorResponse(500, 'Internal Server Error'));
+        }
+      });
   });
+  server.keepAliveTimeout = 10_000;
+  return server;
 }
